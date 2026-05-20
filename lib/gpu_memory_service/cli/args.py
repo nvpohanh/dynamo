@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from gpu_memory_service.common.utils import get_socket_path
+from gpu_memory_service.common.vmm import VMMDeviceType
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class Config:
     alloc_retry_interval: float
     alloc_retry_timeout: Optional[float]
     verbose: bool
+    device_kind: VMMDeviceType
 
 
 def parse_args() -> Config:
@@ -68,6 +70,13 @@ def parse_args() -> Config:
         help="Max seconds to wait for allocation retries before failing (default: 60.0). "
         "Pass an explicit large value if you need essentially-unbounded retry.",
     )
+    parser.add_argument(
+        "--device-kind",
+        type=str,
+        default=VMMDeviceType.CUDA.value,
+        choices=[d.value for d in VMMDeviceType],
+        help="VMM device kind (vendor driver) to use (default: cuda).",
+    )
 
     args = parser.parse_args()
 
@@ -85,4 +94,5 @@ def parse_args() -> Config:
         alloc_retry_interval=args.alloc_retry_interval,
         alloc_retry_timeout=args.alloc_retry_timeout,
         verbose=args.verbose,
+        device_kind=VMMDeviceType.from_str(args.device_kind),
     )
