@@ -15,6 +15,7 @@ import asyncio
 import logging
 
 import uvloop
+from gpu_memory_service.common.vmm import init_vmm
 from gpu_memory_service.server.rpc import GMSRPCServer
 
 from .args import parse_args
@@ -35,9 +36,11 @@ async def worker() -> None:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("gpu_memory_service").setLevel(logging.DEBUG)
 
+    init_vmm(config.device_type)
+
     logger.info(f"Starting GPU Memory Service Server for device {config.device}")
     logger.info("GMS tag: %s", config.tag)
-    logger.info("VMM device kind: %s", config.device_kind.value)
+    logger.info("VMM device type: %s", config.device_type.value)
     logger.info(f"Socket path: {config.socket_path}")
     logger.info(
         "Allocation retry config: interval=%ss timeout=%s",
@@ -54,7 +57,6 @@ async def worker() -> None:
         device=config.device,
         allocation_retry_interval=config.alloc_retry_interval,
         allocation_retry_timeout=config.alloc_retry_timeout,
-        device_kind=config.device_kind,
     )
 
     logger.info("GPU Memory Service Server ready, waiting for connections...")
