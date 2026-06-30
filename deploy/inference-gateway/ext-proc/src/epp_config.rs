@@ -5,12 +5,15 @@
 //!
 //! `DYN_EPP_MODE` selects the EPP mode: `full-dynamo-stack` (default) or
 //! `router-only` (fronts raw `vllm serve` pods with no Dynamo runtime and
-//! delegates KV-aware selection to the standalone selection service). The pod
-//! selector and target port come from the `InferencePool`; the rest of the
-//! router-only contract comes from the environment and is parsed here.
+//! delegates KV-aware selection to the standalone selection service). In
+//! router-only mode `DYN_EPP_SELECTOR_MODE` picks how the EPP reaches the
+//! selector (`http` fleet or in-process `embedded`). The pod selector and target
+//! port come from the `InferencePool`; the rest of the contract comes from the
+//! environment and is parsed here.
 
 const DEFAULT_KV_EVENT_PORT: u16 = 5557;
 const DEFAULT_DATA_PARALLEL_SIZE: u32 = 1;
+const DEFAULT_SELECTOR_THREADS: usize = 4;
 const DEFAULT_SELECTOR_HTTP_PORT: u16 = 8092;
 const DEFAULT_SELECTOR_REPLICA_SYNC_PORT: u16 = 9092;
 
@@ -53,12 +56,36 @@ impl EppMode {
     }
 }
 
+/// How the EPP reaches the worker selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorBackendMode {
+    /// Replicated/production: HTTP client to selection-service replicas
+    /// (`selector-http` feature).
+    Http,
+    /// Single-image evaluation: an in-process `SelectionCore`, no HTTP client
+    /// (`selector-embedded` feature).
+    Embedded,
+}
+
+/// Default selector backend when `DYN_EPP_SELECTOR_MODE` is unset: HTTP when that
+/// backend is compiled in, otherwise embedded.
+fn default_mode() -> SelectorBackendMode {
+    if cfg!(feature = "selector-http") {
+        SelectorBackendMode::Http
+    } else {
+        SelectorBackendMode::Embedded
+    }
+}
+
 /// Router-only configuration, built from the environment with fail-fast
 /// validation. The pod selector and target port are NOT here — they come from
 /// the `InferencePool` named by `pool_name` at runtime.
 #[derive(Debug, Clone)]
 pub struct EppConfig {
-    /// Selection-service `Service` whose EndpointSlices the EPP watches.
+    /// How the EPP reaches the selector (HTTP fleet vs in-process embedded).
+    pub mode: SelectorBackendMode,
+    /// Selection-service `Service` whose EndpointSlices the EPP watches. Required
+    /// for [`SelectorBackendMode::Http`]; unused for [`SelectorBackendMode::Embedded`].
     pub selector_service: String,
     /// Namespace of the selection-service `Service` (default `POD_NAMESPACE`).
     pub selector_service_namespace: Option<String>,
@@ -66,6 +93,8 @@ pub struct EppConfig {
     pub selector_http_port: u16,
     /// ZMQ replica-sync PUB port each selection-service replica binds.
     pub selector_replica_sync_port: u16,
+    /// KV indexer thread-pool size for [`SelectorBackendMode::Embedded`].
+    pub selector_threads: usize,
     /// `InferencePool` this EPP backs; its selector + target port drive discovery.
     pub pool_name: String,
     /// Namespace of the `InferencePool` (default `POD_NAMESPACE`).
@@ -97,12 +126,31 @@ impl EppConfig {
     /// Parse from an injectable getter. Keeps parsing pure so tests supply a map
     /// instead of mutating the process-global environment.
     fn parse(get: &EnvGet) -> anyhow::Result<Self> {
-        let selector_service = require(get, "DYN_EPP_SELECTOR_SERVICE")?;
+        let mode = match trimmed(get("DYN_EPP_SELECTOR_MODE")).as_deref() {
+            None => default_mode(),
+            Some("http") => SelectorBackendMode::Http,
+            Some("embedded") => SelectorBackendMode::Embedded,
+            Some(other) => anyhow::bail!(
+                "DYN_EPP_SELECTOR_MODE has invalid value {other:?}; expected 'http' or 'embedded'"
+            ),
+        };
+
+        // The selector Service is only meaningful for the HTTP fleet; embedded
+        // runs the selector in-process and ignores it.
+        let selector_service = trimmed(get("DYN_EPP_SELECTOR_SERVICE")).unwrap_or_default();
+        if matches!(mode, SelectorBackendMode::Http) && selector_service.is_empty() {
+            anyhow::bail!(
+                "DYN_EPP_SELECTOR_SERVICE is required in http selector mode \
+                 (name of the selection-service Kubernetes Service)"
+            );
+        }
         let selector_service_namespace = trimmed(get("DYN_EPP_SELECTOR_SERVICE_NAMESPACE"));
-        let selector_http_port =
-            opt_parse::<u16>(get, "DYN_EPP_SELECTOR_HTTP_PORT")?.unwrap_or(DEFAULT_SELECTOR_HTTP_PORT);
+        let selector_http_port = opt_parse::<u16>(get, "DYN_EPP_SELECTOR_HTTP_PORT")?
+            .unwrap_or(DEFAULT_SELECTOR_HTTP_PORT);
         let selector_replica_sync_port = opt_parse::<u16>(get, "DYN_EPP_SELECTOR_REPLICA_SYNC_PORT")?
             .unwrap_or(DEFAULT_SELECTOR_REPLICA_SYNC_PORT);
+        let selector_threads =
+            opt_parse::<usize>(get, "DYN_EPP_SELECTOR_THREADS")?.unwrap_or(DEFAULT_SELECTOR_THREADS);
 
         let pool_name = require(get, "DYN_EPP_POOL_NAME")?;
         let pool_namespace = trimmed(get("DYN_EPP_POOL_NAMESPACE"));
@@ -125,10 +173,12 @@ impl EppConfig {
         let max_num_batched_tokens = opt_parse::<u64>(get, "DYN_MAX_NUM_BATCHED_TOKENS")?;
 
         Ok(Self {
+            mode,
             selector_service,
             selector_service_namespace,
             selector_http_port,
             selector_replica_sync_port,
+            selector_threads,
             pool_name,
             pool_namespace,
             model_name,
@@ -243,6 +293,7 @@ mod tests {
             cfg.selector_replica_sync_port,
             DEFAULT_SELECTOR_REPLICA_SYNC_PORT
         );
+        assert_eq!(cfg.selector_threads, DEFAULT_SELECTOR_THREADS);
         assert_eq!(cfg.pool_name, "vllm-qwen-pool");
         assert!(cfg.pool_namespace.is_none());
         assert_eq!(cfg.model_name, "Qwen/Qwen3-0.6B");
@@ -267,6 +318,33 @@ mod tests {
     }
 
     #[test]
+    fn embedded_mode_does_not_require_service() {
+        let cfg = parse_cfg(&[
+            ("DYN_EPP_SELECTOR_MODE", "embedded"),
+            ("DYN_EPP_POOL_NAME", "vllm-qwen-pool"),
+            ("DYN_MODEL_NAME", "Qwen/Qwen3-0.6B"),
+            ("DYN_KV_CACHE_BLOCK_SIZE", "16"),
+        ])
+        .expect("embedded config should parse without a service");
+        assert_eq!(cfg.mode, SelectorBackendMode::Embedded);
+        assert!(cfg.selector_service.is_empty());
+        assert_eq!(cfg.selector_threads, DEFAULT_SELECTOR_THREADS);
+    }
+
+    #[test]
+    fn invalid_selector_mode_fails() {
+        assert!(
+            parse_cfg(&[
+                ("DYN_EPP_SELECTOR_MODE", "grpc"),
+                ("DYN_EPP_POOL_NAME", "vllm-qwen-pool"),
+                ("DYN_MODEL_NAME", "Qwen/Qwen3-0.6B"),
+                ("DYN_KV_CACHE_BLOCK_SIZE", "16"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn missing_pool_name_fails() {
         assert!(
             parse_cfg(&[
@@ -279,9 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_selector_service_fails() {
+    fn missing_selector_service_fails_in_http_mode() {
+        // Pin http mode so this holds regardless of which selector backend
+        // feature the crate is built with (the default mode is feature-dependent).
         assert!(
             parse_cfg(&[
+                ("DYN_EPP_SELECTOR_MODE", "http"),
                 ("DYN_EPP_POOL_NAME", "vllm-qwen-pool"),
                 ("DYN_MODEL_NAME", "Qwen/Qwen3-0.6B"),
                 ("DYN_KV_CACHE_BLOCK_SIZE", "16"),
