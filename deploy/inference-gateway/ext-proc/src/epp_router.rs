@@ -19,12 +19,14 @@
 //! worker constrained to the currently-Ready pods, and tells Envoy where to send
 //! the request via routing headers. Aggregated serving only.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use dynamo_llm::preprocessor::OpenAIPreprocessor;
+use tokio::sync::Mutex;
 
 use crate::epp_config::{EppConfig, SelectorBackendMode};
 use crate::offline_preprocessor::build_offline_preprocessor;
@@ -46,6 +48,12 @@ pub struct EppRouter {
     _adapter: TopologyAdapter,
     reflector_ready: Arc<AtomicBool>,
     model_name: String,
+    /// `gateway request id -> EPP-minted reservation id` for in-flight bookings.
+    /// The lifecycle callbacks only receive the request id, so this maps it back
+    /// to the reservation the selector booked. Populated in `pick` (before the
+    /// reserve call, so a lost response is still cleaned up on completion) and
+    /// drained in `on_request_complete`.
+    reservations: Mutex<HashMap<String, String>>,
 }
 
 impl EppRouter {
@@ -74,6 +82,7 @@ impl EppRouter {
             _adapter: adapter,
             reflector_ready,
             model_name: cfg.model_name,
+            reservations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -215,9 +224,23 @@ impl EndpointPicker for EppRouter {
             .tokenize(body)
             .map_err(|e| PickError::TokenizationFailed(e.to_string()))?;
 
+        // Selection and booking are one operation. Book under an EPP-minted
+        // reservation id (not the gateway request id): it decouples the booking
+        // key from client-supplied headers (so a reused `x-request-id` can't
+        // collide or 409), stays EPP-known so `on_request_complete` can release
+        // it even if this reserve's response is lost, and is recorded here BEFORE
+        // the call so a failed/timed-out reserve is still cleaned up on
+        // completion.
+        let reservation_id = uuid::Uuid::new_v4().to_string();
+        self.reservations
+            .lock()
+            .await
+            .insert(req.request_id.clone(), reservation_id.clone());
+
         let select_req = SelectRequest {
             model_name: self.model_name.clone(),
             selection_id: Some(req.request_id.clone()),
+            reservation_id: Some(reservation_id),
             token_ids: tokens,
             allowed_worker_ids: Some(allowed),
             priority_jump: (priority_jump > 0.0).then_some(priority_jump),
@@ -226,7 +249,7 @@ impl EndpointPicker for EppRouter {
 
         let resp = self
             .backend
-            .select(&select_req)
+            .select_and_reserve(&select_req)
             .await
             .map_err(|e| PickError::RoutingFailed(e.to_string()))?;
 
@@ -257,6 +280,38 @@ impl EndpointPicker for EppRouter {
             ..Default::default()
         })
     }
+
+    /// The gateway signalled the response is complete: release the booking made
+    /// in `pick`. Looks the reservation up by request id and drops the mapping.
+    /// Idempotent for requests that never booked (e.g. body-less routing).
+    async fn on_request_complete(&self, request_id: &str) {
+        let Some(reservation_id) = self.reservations.lock().await.remove(request_id) else {
+            return;
+        };
+        if let Err(e) = self.backend.free_reservation(&reservation_id).await {
+            tracing::warn!(request_id, %reservation_id, error = %e, "Failed to free reservation");
+        }
+    }
+
+    /// The gateway signalled the first token was generated.
+    ///
+    /// Aggregated serving (the only mode supported today) runs prefill and decode
+    /// on the SAME worker, so there is no separate decode-worker prefill load to
+    /// release here — this is intentionally a no-op.
+    ///
+    /// Disaggregated serving (a follow-up, not yet supported) prefills and
+    /// decodes on different workers; when it lands, this callback must look up the
+    /// booking and tell the selector to drop the prefill contribution from the
+    /// decode worker's load:
+    ///
+    /// ```ignore
+    /// if let Some(reservation_id) = self.reservations.lock().await.get(request_id).cloned() {
+    ///     if let Err(e) = self.backend.prefill_complete(&reservation_id).await {
+    ///         tracing::warn!(request_id, %reservation_id, error = %e, "prefill_complete failed");
+    ///     }
+    /// }
+    /// ```
+    async fn on_prefill_complete(&self, _request_id: &str) {}
 }
 
 fn strip_scheme(endpoint: &str) -> &str {

@@ -57,13 +57,21 @@ pub struct WorkerPatch {
     pub stable_routing_id: Option<String>,
 }
 
-/// Query-only selection request (`POST /select`). Prompt fields are sent flat;
+/// Select-and-reserve request (`POST /select_and_reserve`). Selection and
+/// booking are one operation: the selector picks a worker AND books the
+/// request's load against it under `reservation_id`. Prompt fields are sent flat;
 /// sending raw `token_ids` lets the selector compute block/sequence hashes.
 #[derive(Debug, Clone, Serialize)]
 pub struct SelectRequest {
     pub model_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_id: Option<String>,
+    /// Booking key. The EPP uses the gateway request id, so the later
+    /// `free_reservation`/`prefill_complete` calls need no extra bookkeeping map.
+    /// If `None`, the selector generates one (which the EPP would then have to
+    /// read back from the response).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation_id: Option<String>,
     pub token_ids: Vec<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_worker_ids: Option<HashSet<u64>>,
@@ -86,11 +94,15 @@ pub struct OverlapSummary {
     pub disk: u32,
 }
 
-/// Selection result returned by `/select`.
+/// Selection result returned by `/select_and_reserve`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SelectResponse {
     #[serde(default)]
     pub selection_id: Option<String>,
+    /// The booking key the selector recorded (echoes the request's
+    /// `reservation_id`, or the selector-generated one when it was omitted).
+    #[serde(default)]
+    pub reservation_id: Option<String>,
     pub worker_id: u64,
     pub dp_rank: u32,
     pub endpoint: String,
@@ -117,8 +129,30 @@ pub trait SelectionBackend: Send + Sync + 'static {
     /// core.
     async fn reconcile(&self, desired: &HashMap<u64, WorkerRegistration>) -> anyhow::Result<()>;
 
-    /// Query-only worker selection for a prompt.
-    async fn select(&self, req: &SelectRequest) -> anyhow::Result<SelectResponse>;
+    /// Select a worker for a prompt AND book its load in one operation
+    /// (`POST /select_and_reserve`). The returned [`SelectResponse::reservation_id`]
+    /// is the booking that must later be released with [`Self::free_reservation`].
+    async fn select_and_reserve(&self, req: &SelectRequest) -> anyhow::Result<SelectResponse>;
+
+    /// Release a booking (`DELETE /reservations/{id}`), removing the request from
+    /// the selector's slot tracker / active-load accounting. Called when the
+    /// gateway signals the response is complete. Idempotent: an unknown
+    /// reservation (e.g. a body-less request that never booked) is treated as
+    /// success.
+    async fn free_reservation(&self, reservation_id: &str) -> anyhow::Result<()>;
+
+    /// Release *prefill* tokens for a booking from a decode worker's load
+    /// (`POST /reservations/{id}/prefill_complete`), called when the first token
+    /// is generated.
+    ///
+    /// This is meaningful only for **disaggregated** serving, where prefill and
+    /// decode run on different workers and the decode worker's load must drop the
+    /// prefill contribution once prefill finishes. In **aggregated** serving
+    /// (the only mode supported today) prefill and decode share one worker, so
+    /// there is nothing to release and the EPP does not call this — see
+    /// [`crate::epp_router::EppRouter::on_prefill_complete`]. Implemented now so
+    /// the disaggregated path is ready when it lands.
+    async fn prefill_complete(&self, reservation_id: &str) -> anyhow::Result<()>;
 
     /// Returns `true` once the selector can schedule at least one worker.
     async fn any_ready(&self) -> bool;
@@ -163,6 +197,7 @@ mod tests {
         let req = SelectRequest {
             model_name: "m".to_string(),
             selection_id: Some("s1".to_string()),
+            reservation_id: Some("req-42".to_string()),
             token_ids: vec![1, 2, 3],
             allowed_worker_ids: Some(HashSet::from([7u64])),
             priority_jump: None,
@@ -171,6 +206,7 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["token_ids"], serde_json::json!([1, 2, 3]));
         assert_eq!(v["selection_id"], "s1");
+        assert_eq!(v["reservation_id"], "req-42");
         assert_eq!(v["allowed_worker_ids"], serde_json::json!([7]));
         assert!(v.get("priority_jump").is_none());
     }

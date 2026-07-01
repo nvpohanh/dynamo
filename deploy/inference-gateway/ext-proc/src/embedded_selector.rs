@@ -19,9 +19,10 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use dynamo_kv_router::config::kv_router_config_from_dynamo_env;
+use dynamo_kv_router::protocols::RoutingConstraints;
 use dynamo_kv_router::services::selection::{
-    PromptRequest, SelectRequest as CoreSelectRequest, SelectionCore, SelectionError,
-    WorkerRequest as CoreWorkerRequest,
+    PromptRequest, SelectAndReserveRequest as CoreSelectAndReserveRequest, SelectionCore,
+    SelectionError, WorkerRequest as CoreWorkerRequest,
 };
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -135,27 +136,32 @@ impl SelectionBackend for EmbeddedSelectionBackend {
         Ok(())
     }
 
-    async fn select(&self, req: &SelectRequest) -> Result<SelectResponse> {
-        let core_req = CoreSelectRequest {
+    async fn select_and_reserve(&self, req: &SelectRequest) -> Result<SelectResponse> {
+        let core_req = CoreSelectAndReserveRequest {
             model_name: req.model_name.clone(),
             tenant_id: DEFAULT_TENANT.to_string(),
             selection_id: req.selection_id.clone(),
+            reservation_id: req.reservation_id.clone(),
             prompt: PromptRequest {
                 token_ids: Some(req.token_ids.clone()),
                 ..Default::default()
             },
-            allowed_worker_ids: req.allowed_worker_ids.clone(),
+            router_config_override: None,
+            expected_output_tokens: None,
             priority_jump: req.priority_jump,
             strict_priority: req.strict_priority,
-            ..Default::default()
+            pinned_worker: None,
+            allowed_worker_ids: req.allowed_worker_ids.clone(),
+            routing_constraints: RoutingConstraints::default(),
         };
         let resp = self
             .core
-            .select(core_req)
+            .select_and_reserve(core_req)
             .await
-            .map_err(|e| anyhow!("embedded select failed: {e}"))?;
+            .map_err(|e| anyhow!("embedded select_and_reserve failed: {e}"))?;
         Ok(SelectResponse {
             selection_id: resp.selection_id,
+            reservation_id: resp.reservation_id,
             worker_id: resp.worker_id,
             dp_rank: resp.dp_rank,
             endpoint: resp.endpoint,
@@ -168,6 +174,22 @@ impl SelectionBackend for EmbeddedSelectionBackend {
             },
             effective_prefill_tokens: resp.effective_prefill_tokens,
         })
+    }
+
+    async fn free_reservation(&self, reservation_id: &str) -> Result<()> {
+        match self.core.free_reservation(reservation_id).await {
+            // A reservation that was never booked (e.g. a body-less request) is
+            // not an error (idempotent).
+            Ok(()) | Err(SelectionError::NotFound(_)) => Ok(()),
+            Err(e) => Err(anyhow!("embedded free_reservation failed: {e}")),
+        }
+    }
+
+    async fn prefill_complete(&self, reservation_id: &str) -> Result<()> {
+        match self.core.prefill_complete(reservation_id).await {
+            Ok(()) | Err(SelectionError::NotFound(_)) => Ok(()),
+            Err(e) => Err(anyhow!("embedded prefill_complete failed: {e}")),
+        }
     }
 
     async fn any_ready(&self) -> bool {
