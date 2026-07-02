@@ -5,40 +5,50 @@
 //! (`POST /inference/v1/generate`).
 //!
 //! These mirror vLLM's `GenerateRequest` / `GenerateResponse` wire contract
-//! (`vllm/entrypoints/serve/disagg/protocol.py`). The text-only subset is
-//! captured here; `sampling_params` is kept opaque (`serde_json::Value`) for
-//! now — the typed sampling envelope lands in a follow-up.
-//!
-//! Deferred to follow-up PRs (intentionally absent here): `features`
-//! (multimodal), `stream_options`, negative-`token_ids` validation-message
-//! parity with vLLM, and auto-generating a `request_id` when absent.
+//! (`vllm/entrypoints/scale_out/token_in_token_out/protocol.py`). Only the
+//! fields the frontend itself acts on are typed; `sampling_params` is kept
+//! opaque (`serde_json::Value`) and every other field — including ones a newer
+//! vLLM adds (`features`, `stream_options`, …) — is captured in `vllm_passthrough`
+//! via `#[serde(flatten)]` and forwarded to the worker verbatim, so the wire
+//! contract is forward-compatible: a new vLLM request field flows through with
+//! no change here.
 
 use serde::{Deserialize, Serialize};
 
 /// Token-in/token-out generation request.
+///
+/// Only the fields the frontend acts on are typed. `sampling_params` stays
+/// opaque so the worker reconstructs vLLM's own `SamplingParams` verbatim; all
+/// other fields (`priority`, `cache_salt`, `kv_transfer_params`, `features`, and
+/// anything a newer vLLM adds) are captured in [`Self::vllm_passthrough`] via
+/// `#[serde(flatten)]` and forwarded untouched — forward-compatible by
+/// construction.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GenerateRequest {
+    /// Client-supplied request id, echoed back. The server generates one if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 
+    /// Pre-tokenized prompt. Required — this is the KV-routing input.
     pub token_ids: Vec<u32>,
 
+    /// Opaque vLLM `sampling_params`; forwarded verbatim and parsed at the worker.
     pub sampling_params: serde_json::Value,
 
+    /// Model / alias for worker selection. Optional (single-model deployments omit it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Streaming vs. unary response.
     #[serde(default)]
     pub stream: bool,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_salt: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<i64>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_transfer_params: Option<serde_json::Value>,
+    /// Every other top-level field — vLLM's own params (`priority`, `cache_salt`,
+    /// `kv_transfer_params`, `features`, …) plus anything a newer vLLM adds —
+    /// captured verbatim and forwarded to the worker untouched. Keeps the
+    /// contract forward-compatible with newer vLLM versions.
+    #[serde(flatten)]
+    pub vllm_passthrough: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A single choice in a `GenerateResponse`.
@@ -94,18 +104,29 @@ mod tests {
     }
 
     #[test]
-    fn generate_request_minimal_defaults() {
-        // Unknown fields are ignored, stream defaults false, optionals default None.
+    fn generate_request_captures_unknown_fields() {
+        // Untyped + future fields are CAPTURED in `vllm_passthrough` (forwarded
+        // verbatim), not dropped — so a field a newer vLLM adds flows through.
         let raw = json!({
             "token_ids": [5, 6],
             "sampling_params": {},
-            "future_field": "ignored"
+            "priority": 7,
+            "future_field": "kept"
         });
         let req: GenerateRequest = serde_json::from_value(raw).expect("deserialize");
         assert_eq!(req.token_ids, vec![5, 6]);
         assert!(!req.stream);
         assert_eq!(req.request_id, None);
-        assert_eq!(req.priority, None);
+        // Not typed on the struct → captured in `vllm_passthrough`.
+        assert_eq!(req.vllm_passthrough.get("priority"), Some(&json!(7)));
+        assert_eq!(
+            req.vllm_passthrough.get("future_field"),
+            Some(&json!("kept"))
+        );
+        // Round-trip: flattened fields serialize back at the top level.
+        let back = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(back.get("priority"), Some(&json!(7)));
+        assert_eq!(back.get("future_field"), Some(&json!("kept")));
     }
 
     #[test]

@@ -4,11 +4,11 @@
 //! HTTP handler for the token-in/token-out `Generate` API
 //! (`POST /inference/v1/generate`).
 //!
-//! This is an experimental endpoint, enabled by default (matching vLLM,
-//! which mounts `/inference/v1/generate` for any generate-capable model).
-//! It registers the route with a placeholder handler that returns HTTP 501
-//! Not Implemented; the real handler (engine dispatch + `LLMEngineOutput`
-//! accumulation) lands in a follow-up. Disable via `enable_generate_endpoints`.
+//! This is an experimental engine-native endpoint, **disabled by default**;
+//! opt in via the `enable_engine_apis` builder flag or the
+//! `DYN_ENABLE_ENGINE_API` env var. When enabled it registers the route with a
+//! placeholder handler that returns HTTP 501 Not Implemented; the real handler
+//! (engine dispatch + `LLMEngineOutput` accumulation) lands in a follow-up.
 
 use std::sync::Arc;
 
@@ -94,7 +94,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let service = HttpService::builder()
             .port(port)
-            .enable_generate_endpoints(enable_generate)
+            .enable_engine_apis(enable_generate)
             .build()
             .unwrap();
         let cancel_token = CancellationToken::new();

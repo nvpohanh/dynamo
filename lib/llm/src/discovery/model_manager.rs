@@ -795,6 +795,13 @@ impl ModelManager {
             .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))
     }
 
+    pub fn remove_audios_model(&self, model: &str) -> Result<(), ModelManagerError> {
+        let namespace = format!("__local_audios_{}", model);
+        self.remove_worker_set(model, &namespace)
+            .map(|_| ())
+            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))
+    }
+
     pub fn remove_realtime_model(&self, model: &str) -> Result<(), ModelManagerError> {
         let namespace = format!("__local_realtime_{}", model);
         self.remove_worker_set(model, &namespace)
