@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use futures::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::protocols::Annotated;
 use crate::protocols::common::llm_backend::LLMEngineOutput;
@@ -37,6 +37,7 @@ pub struct GenerateRequest {
     pub request_id: Option<String>,
 
     /// Pre-tokenized prompt. Required — this is the KV-routing input.
+    #[serde(deserialize_with = "deserialize_non_empty_token_ids")]
     pub token_ids: Vec<u32>,
 
     /// Opaque vLLM `sampling_params`; forwarded verbatim and parsed at the worker.
@@ -56,6 +57,19 @@ pub struct GenerateRequest {
     /// contract forward-compatible with newer vLLM versions.
     #[serde(flatten)]
     pub vllm_passthrough: serde_json::Map<String, serde_json::Value>,
+}
+
+fn deserialize_non_empty_token_ids<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let token_ids = Vec::<u32>::deserialize(deserializer)?;
+    if token_ids.is_empty() {
+        return Err(serde::de::Error::custom(
+            "token_ids must contain at least one token",
+        ));
+    }
+    Ok(token_ids)
 }
 
 /// A single choice in a `GenerateResponse`.
@@ -239,6 +253,21 @@ mod tests {
         let back = serde_json::to_value(&req).expect("serialize");
         assert_eq!(back.get("priority"), Some(&json!(7)));
         assert_eq!(back.get("future_field"), Some(&json!("kept")));
+    }
+
+    #[test]
+    fn generate_request_rejects_empty_token_ids() {
+        let error = serde_json::from_value::<GenerateRequest>(json!({
+            "token_ids": [],
+            "sampling_params": {}
+        }))
+        .expect_err("empty token_ids must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("token_ids must contain at least one token")
+        );
     }
 
     #[test]

@@ -364,6 +364,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_route_rejects_empty_token_ids() {
+        let (port, handle) = serve(Some(true)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://localhost:{}/inference/v1/generate", port))
+            .header("content-type", "application/json")
+            .body(r#"{"token_ids":[],"sampling_params":{}}"#)
+            .send()
+            .await
+            .expect("generate request failed");
+
+        assert_eq!(resp.status().as_u16(), StatusCode::BAD_REQUEST.as_u16());
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            body["message"].as_str().is_some_and(
+                |message| message.contains("token_ids must contain at least one token")
+            )
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn generate_route_404_by_default() {
         temp_env::async_with_vars(
