@@ -49,8 +49,10 @@ fn finish_with_replay_wall_time(
     collector.finish().with_wall_time_ms(wall_time_ms)
 }
 
-fn use_single_runtime(num_workers: usize, router_mode: ReplayRouterMode) -> bool {
-    num_workers == 1 && router_mode != ReplayRouterMode::KvRouter
+fn use_single_runtime(num_workers: usize, dp_size: u32, router_mode: ReplayRouterMode) -> bool {
+    // dp_size>1 needs one scheduler/KV pool per rank. They still share one
+    // discrete-event runtime, but require the rank-aware AggRuntime path.
+    num_workers == 1 && dp_size <= 1 && router_mode != ReplayRouterMode::KvRouter
 }
 
 /// Run the deterministic offline half of the live/offline handoff conformance
@@ -203,7 +205,7 @@ pub(crate) fn simulate_trace(
     max_sim_time_ms: Option<f64>,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    if use_single_runtime(num_workers, router_mode) {
+    if use_single_runtime(num_workers, args.dp_size, router_mode) {
         simulate_trace_single(
             args,
             requests,
@@ -241,7 +243,7 @@ pub(crate) fn simulate_concurrency(
     max_sim_time_ms: Option<f64>,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    if use_single_runtime(num_workers, router_mode) {
+    if use_single_runtime(num_workers, args.dp_size, router_mode) {
         simulate_concurrency_single(
             args,
             requests,
@@ -301,7 +303,7 @@ pub(crate) fn simulate_agentic_trace_workload(
     router_mode: ReplayRouterMode,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    if use_single_runtime(num_workers, router_mode) {
+    if use_single_runtime(num_workers, args.dp_size, router_mode) {
         simulate_agentic_trace_workload_single(args, trace, sla)
     } else {
         simulate_agentic_trace_workload_multi(
@@ -355,7 +357,7 @@ fn simulate_trace_workload_with_delta_mode(
     max_sim_time_ms: Option<f64>,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    if use_single_runtime(num_workers, router_mode) {
+    if use_single_runtime(num_workers, args.dp_size, router_mode) {
         simulate_trace_workload_single(
             args,
             trace,
@@ -450,7 +452,7 @@ fn simulate_concurrency_workload_with_delta_mode(
     max_sim_time_ms: Option<f64>,
     sla: SlaThresholds,
 ) -> Result<TraceSimulationReport> {
-    if use_single_runtime(num_workers, router_mode) {
+    if use_single_runtime(num_workers, args.dp_size, router_mode) {
         simulate_concurrency_workload_single(
             args,
             trace,
@@ -1163,10 +1165,12 @@ mod tests {
 
     #[test]
     fn single_runtime_selection_excludes_kv_router() {
-        assert!(use_single_runtime(1, ReplayRouterMode::RoundRobin));
-        assert!(!use_single_runtime(1, ReplayRouterMode::KvRouter));
-        assert!(!use_single_runtime(2, ReplayRouterMode::RoundRobin));
-        assert!(!use_single_runtime(2, ReplayRouterMode::KvRouter));
+        assert!(use_single_runtime(1, 1, ReplayRouterMode::RoundRobin));
+        assert!(!use_single_runtime(1, 1, ReplayRouterMode::KvRouter));
+        assert!(!use_single_runtime(2, 1, ReplayRouterMode::RoundRobin));
+        assert!(!use_single_runtime(2, 1, ReplayRouterMode::KvRouter));
+        // dp_size>1 forces the multi (per-rank) path even with a single worker.
+        assert!(!use_single_runtime(1, 8, ReplayRouterMode::RoundRobin));
     }
 
     #[cfg(feature = "kvbm-offload")]

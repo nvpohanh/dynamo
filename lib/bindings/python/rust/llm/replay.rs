@@ -1665,7 +1665,25 @@ fn materialize_replay_mocker_args(
         let undiscounted_accept_rates = args.undiscounted_aic_accept_rates();
         // AIC-backed config may intentionally omit num_gpu_blocks. Estimate it
         // here, after candidate TP/backend/model overrides have been applied.
-        if !extra_args.num_gpu_blocks_explicit() {
+        let dp = attention_dp_size.unwrap_or(1).max(1);
+        let dp = u32::try_from(dp)
+            .map_err(|_| PyException::new_err("aic_attention_dp_size does not fit into a u32"))?;
+        if args.dp_size > 1 && args.dp_size != dp {
+            return Err(PyException::new_err(format!(
+                "dp_size must match aic_attention_dp_size for AIC-backed replay (got dp_size={}, aic_attention_dp_size={dp})",
+                args.dp_size
+            )));
+        }
+        if dp > 1 {
+            // Attention-DP is scheduler topology even when num_gpu_blocks was
+            // supplied explicitly; each rank owns one per-rank KV pool.
+            args.dp_size = dp;
+        }
+        let num_gpu_blocks_explicit = extra_args.num_gpu_blocks_explicit();
+        // Under attention-DP, mirror the live path: one mocker worker owns
+        // `dp_size` independent per-rank schedulers, each with a per-rank KV pool.
+        // The topology applies whether KV capacity is explicit or estimated.
+        if !num_gpu_blocks_explicit {
             let per_rank_blocks = estimate_aic_num_gpu_blocks(
                 py,
                 &backend,
@@ -1695,14 +1713,11 @@ fn materialize_replay_mocker_args(
                     e
                 ))
             })?;
-            // AIC returns a per-rank (per-GPU) block count. Offline replay models a single
-            // KV pool per engine, so under DP-attention -- where each of the `dp` ranks holds
-            // a full KV replica for its slice of the batch -- the engine-wide pool is
-            // `per_rank * dp`. (The live mocker instead replicates one scheduler per dp rank,
-            // see lib/llm/src/mocker.rs, so it must keep the per-rank count; that is why this
-            // scaling lives on the offline-replay path and not inside the estimator.)
-            let dp = attention_dp_size.unwrap_or(1).max(1);
-            args.num_gpu_blocks = per_rank_blocks.saturating_mul(dp);
+            // AIC returns a per-rank (per-GPU) block count. When replicating attention-DP
+            // into per-rank workers, each worker owns this per-rank pool (engine-wide
+            // capacity stays `per_rank * dp`, now partitioned per rank as on real hardware).
+            // With dp == 1 the per-rank pool is the engine-wide pool.
+            args.num_gpu_blocks = per_rank_blocks;
         }
         let callback = create_aic_callback(
             py,
@@ -1735,15 +1750,8 @@ fn materialize_replay_mocker_args(
             model_name,
             backend_version
         );
-        // Offline replay runs a single aggregate engine holding the GLOBAL batch
-        // across all attention-DP ranks (it scales num_gpu_blocks by dp above and
-        // forbids scheduler-level dp_size>1). Record attention_dp_size so the perf
-        // model divides the scheduled batch back to the per-rank batch the AIC SDK
-        // expects. The live path keeps the default of 1 (it replicates per rank).
-        args.perf_model = Arc::new(PerfModel::from_aic_callback_with_attention_dp(
-            callback,
-            attention_dp_size.unwrap_or(1).max(1),
-        ));
+        // Every scheduler sees its own local batch, including under attention-DP.
+        args.perf_model = Arc::new(PerfModel::from_aic_callback(callback));
     }
 
     Ok(args)

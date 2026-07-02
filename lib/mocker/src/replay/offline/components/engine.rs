@@ -23,15 +23,19 @@ fn fpm_has_scheduled_work(snapshot: &ForwardPassSnapshot) -> bool {
 pub(in crate::replay::offline) struct EngineComponent {
     stage: SimulationWorkerStage,
     pass_mode: EnginePassMode,
-    /// Workers keyed by stable ID (monotonic, never reused).
+    /// DP-rank schedulers keyed by stable ID (monotonic, never reused).
     workers: BTreeMap<usize, OfflineWorkerState>,
-    /// Counter for generating the next stable worker ID.
+    /// Mocker worker IDs mapped to their per-rank scheduler IDs.
+    worker_groups: BTreeMap<usize, Vec<usize>>,
+    /// Counter for generating the next stable scheduler ID.
     next_id: usize,
-    /// Workers marked for removal — skipped by round-robin, removed when drained.
+    /// Counter for generating the next stable mocker worker ID.
+    next_worker_id: usize,
+    /// Mocker workers marked for removal — skipped by round-robin, removed when drained.
     pending_removal: BTreeSet<usize>,
-    /// Workers still starting up — excluded from active set until ready.
+    /// Mocker workers still starting up — excluded from active set until ready.
     pending_startup: BTreeSet<usize>,
-    /// Engine args used to construct new workers during scale-up.
+    /// Engine args used to construct new DP-rank schedulers during scale-up.
     args: MockEngineArgs,
     /// Whether new workers should capture KV events (true when a router is present).
     capture_kv_events: bool,
@@ -45,15 +49,62 @@ impl EngineComponent {
     ) -> Self {
         let count = workers.len();
         let map: BTreeMap<usize, OfflineWorkerState> = workers.into_iter().enumerate().collect();
+        let worker_groups = (0..count).map(|id| (id, vec![id])).collect();
         Self {
             stage,
             pass_mode,
             workers: map,
+            worker_groups,
             next_id: count,
+            next_worker_id: count,
             pending_removal: BTreeSet::new(),
             pending_startup: BTreeSet::new(),
             args: MockEngineArgs::default(),
             capture_kv_events: false,
+        }
+    }
+
+    /// Build one scheduler core per DP rank while retaining the live mocker's
+    /// `(worker_id, dp_rank)` topology.
+    pub(in crate::replay::offline) fn new_ranked(
+        stage: SimulationWorkerStage,
+        pass_mode: EnginePassMode,
+        args: MockEngineArgs,
+        num_workers: usize,
+        capture_kv_events: bool,
+    ) -> Self {
+        let dp_size = args.dp_size.max(1) as usize;
+        let mut workers = BTreeMap::new();
+        let mut worker_groups = BTreeMap::new();
+        for worker_id in 0..num_workers {
+            let mut rank_ids = Vec::with_capacity(dp_size);
+            for dp_rank in 0..dp_size {
+                let rank_id = worker_id * dp_size + dp_rank;
+                workers.insert(
+                    rank_id,
+                    OfflineWorkerState::new_with_rank(
+                        rank_id,
+                        worker_id as u64,
+                        dp_rank as u32,
+                        args.clone(),
+                        capture_kv_events,
+                    ),
+                );
+                rank_ids.push(rank_id);
+            }
+            worker_groups.insert(worker_id, rank_ids);
+        }
+        Self {
+            stage,
+            pass_mode,
+            workers,
+            worker_groups,
+            next_id: num_workers.saturating_mul(dp_size),
+            next_worker_id: num_workers,
+            pending_removal: BTreeSet::new(),
+            pending_startup: BTreeSet::new(),
+            args,
+            capture_kv_events,
         }
     }
 
@@ -67,13 +118,27 @@ impl EngineComponent {
         self.capture_kv_events = capture_kv_events;
     }
 
-    /// Add a new worker, returning its stable ID.
+    /// Add a new mocker worker and all of its DP-rank schedulers, returning
+    /// the stable mocker worker ID.
     pub(in crate::replay::offline) fn add_worker(&mut self) -> usize {
-        let id = self.next_id;
-        self.next_id += 1;
-        let worker = OfflineWorkerState::new(id, self.args.clone(), self.capture_kv_events);
-        self.workers.insert(id, worker);
-        id
+        let worker_id = self.next_worker_id;
+        self.next_worker_id += 1;
+        let mut rank_ids = Vec::with_capacity(self.args.dp_size.max(1) as usize);
+        for dp_rank in 0..self.args.dp_size.max(1) {
+            let rank_id = self.next_id;
+            self.next_id += 1;
+            let worker = OfflineWorkerState::new_with_rank(
+                rank_id,
+                worker_id as u64,
+                dp_rank,
+                self.args.clone(),
+                self.capture_kv_events,
+            );
+            self.workers.insert(rank_id, worker);
+            rank_ids.push(rank_id);
+        }
+        self.worker_groups.insert(worker_id, rank_ids);
+        worker_id
     }
 
     /// Mark a worker for removal. It will be skipped by `drive_ready` and
@@ -86,8 +151,12 @@ impl EngineComponent {
     pub(in crate::replay::offline) fn try_remove_drained(&mut self) -> Vec<usize> {
         let mut removed = Vec::new();
         self.pending_removal.retain(|&id| {
-            if let Some(worker) = self.workers.get(&id) {
-                if worker.is_drained() {
+            if let Some(rank_ids) = self.worker_groups.get(&id) {
+                if rank_ids.iter().all(|rank_id| {
+                    self.workers
+                        .get(rank_id)
+                        .is_none_or(OfflineWorkerState::is_drained)
+                }) {
                     removed.push(id);
                     return false; // remove from pending set
                 }
@@ -98,7 +167,11 @@ impl EngineComponent {
             true // keep in pending set
         });
         for &id in &removed {
-            self.workers.remove(&id);
+            if let Some(rank_ids) = self.worker_groups.remove(&id) {
+                for rank_id in rank_ids {
+                    self.workers.remove(&rank_id);
+                }
+            }
         }
         removed
     }
@@ -117,7 +190,7 @@ impl EngineComponent {
         &mut self,
         target: usize,
     ) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
-        let active_ids = self.active_worker_ids();
+        let active_ids = self.active_group_ids();
         let effective = active_ids.len() + self.pending_startup.len();
         let mut added = Vec::new();
         let mut newly_marked = Vec::new();
@@ -144,7 +217,11 @@ impl EngineComponent {
                 .collect();
             for &id in &to_cancel {
                 self.pending_startup.remove(&id);
-                self.workers.remove(&id);
+                if let Some(rank_ids) = self.worker_groups.remove(&id) {
+                    for rank_id in rank_ids {
+                        self.workers.remove(&rank_id);
+                    }
+                }
             }
 
             // Mark active workers for removal if more excess remains.
@@ -160,20 +237,37 @@ impl EngineComponent {
         (added, newly_marked, removed)
     }
 
-    /// Return stable IDs of all active workers — excludes both pending removal
-    /// and pending startup.
+    /// Return stable scheduler IDs of all active DP ranks — excludes ranks in
+    /// mocker workers pending removal or startup.
     pub(in crate::replay::offline) fn active_worker_ids(&self) -> Vec<usize> {
-        self.workers
+        self.active_group_ids()
+            .into_iter()
+            .flat_map(|worker_id| self.worker_groups[&worker_id].iter().copied())
+            .collect()
+    }
+
+    /// Return stable mocker worker IDs that are active for new admissions.
+    pub(in crate::replay::offline) fn active_group_ids(&self) -> Vec<usize> {
+        self.worker_groups
             .keys()
             .filter(|id| !self.pending_removal.contains(id) && !self.pending_startup.contains(id))
             .copied()
             .collect()
     }
 
+    pub(in crate::replay::offline) fn rank_id(
+        &self,
+        worker_id: usize,
+        dp_rank: u32,
+    ) -> Option<usize> {
+        self.worker_groups
+            .get(&worker_id)
+            .and_then(|rank_ids| rank_ids.get(dp_rank as usize))
+            .copied()
+    }
+
     pub(in crate::replay::offline) fn has_active_workers(&self) -> bool {
-        self.workers
-            .keys()
-            .any(|id| !self.pending_removal.contains(id) && !self.pending_startup.contains(id))
+        !self.active_group_ids().is_empty()
     }
 
     /// Return the configured startup delay in milliseconds, if any.
@@ -188,7 +282,7 @@ impl EngineComponent {
     /// was actually pending startup (and is now active), `false` if the worker
     /// was already cancelled or unknown (stale event).
     pub(in crate::replay::offline) fn mark_worker_ready(&mut self, worker_id: usize) -> bool {
-        self.pending_startup.remove(&worker_id) && self.workers.contains_key(&worker_id)
+        self.pending_startup.remove(&worker_id) && self.worker_groups.contains_key(&worker_id)
     }
 
     pub(in crate::replay::offline) fn dispatch(
@@ -359,7 +453,12 @@ impl EngineComponent {
     }
 
     pub(in crate::replay::offline) fn worker_count(&self) -> usize {
-        self.workers.len()
+        self.worker_groups.len()
+    }
+
+    #[cfg(test)]
+    pub(in crate::replay::offline) fn rank_id_capacity(&self) -> usize {
+        self.next_id
     }
 
     #[cfg(feature = "kvbm-offload")]

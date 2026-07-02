@@ -19,7 +19,7 @@ Offline replay starts in `lib/mocker/src/replay/offline/mod.rs`.
 
 `offline/mod.rs` chooses between three implementations:
 
-- `lib/mocker/src/replay/offline/single.rs` for aggregated replay with `num_workers == 1`
+- `lib/mocker/src/replay/offline/single.rs` for aggregated replay with `num_workers == 1` and `dp_size == 1`
 - `lib/mocker/src/replay/offline/agg.rs` for everything else, including aggregated multi-worker replay and `kv_router` replay
 - `lib/mocker/src/replay/offline/disagg.rs` for offline disaggregated prefill/decode replay
 
@@ -54,7 +54,9 @@ Offline replay starts in `lib/mocker/src/replay/offline/mod.rs`.
 ## Single-Worker Fast Path
 
 The single-worker path is intentionally simple and used when `num_workers == 1`
-for vLLM, SGLang, and TRT-LLM engine modes.
+and `dp_size == 1` for vLLM, SGLang, and TRT-LLM engine modes. Multi-rank
+attention-DP uses the general harness so each rank has an independent scheduler
+and KV pool while all ranks still share one deterministic event loop.
 
 That path avoids the cluster event queue and router machinery entirely, but it now supports both:
 
@@ -93,6 +95,10 @@ The general aggregated harness lives in `lib/mocker/src/replay/offline/agg.rs`. 
 - one [`OfflineWorkerState`](/Users/peabrane/Documents/codes/dynamo/lib/mocker/src/replay/offline/state.rs) per worker
 - a binary heap of future completion events
 - an optional synchronous offline router
+
+For `dp_size > 1`, each mocker worker owns one `OfflineWorkerState` per DP rank.
+The router retains the live `(worker_id, dp_rank)` identity; planner scaling and
+worker accounting continue to count mocker workers rather than rank schedulers.
 
 ### Main Loop
 
