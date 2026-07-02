@@ -536,9 +536,9 @@ pub struct HttpServiceConfig {
 
     /// Experimental engine-native APIs (currently the token-in/token-out
     /// `Generate` endpoint `POST /inference/v1/generate`). **Disabled by
-    /// default** — a deployment opts into this family of engine-native
-    /// surfaces via this builder flag or the `DYN_ENABLE_ENGINE_API` env var.
-    /// When disabled the routes are not mounted, so a request gets a 404.
+    /// default** — a deployment opts into this endpoint via this builder flag
+    /// or the `DYN_VLLM_ENABLE_INFERENCE_V1_GENERATE` env var. When disabled
+    /// the route is not mounted, so a request gets a 404.
     #[builder(default = "false")]
     enable_engine_apis: bool,
 
@@ -877,9 +877,10 @@ static HTTP_SVC_EMB_PATH_ENV: &str = "DYN_HTTP_SVC_EMB_PATH";
 static HTTP_SVC_RESPONSES_PATH_ENV: &str = "DYN_HTTP_SVC_RESPONSES_PATH";
 /// Environment variable to set the anthropic messages endpoint path (default: `/v1/messages`)
 static HTTP_SVC_ANTHROPIC_PATH_ENV: &str = "DYN_HTTP_SVC_ANTHROPIC_PATH";
-/// Environment variable to enable the experimental engine-native APIs (e.g.
-/// `/inference/v1/generate`). Truthy value opts in; disabled by default.
-static ENABLE_ENGINE_API_ENV: &str = "DYN_ENABLE_ENGINE_API";
+/// Environment variable to enable the experimental vLLM-compatible
+/// `/inference/v1/generate` endpoint. Truthy value opts in; disabled by default.
+pub(super) static VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV: &str =
+    "DYN_VLLM_ENABLE_INFERENCE_V1_GENERATE";
 
 impl HttpServiceConfigBuilder {
     pub fn build(self) -> Result<HttpService, anyhow::Error> {
@@ -887,7 +888,8 @@ impl HttpServiceConfigBuilder {
         let metrics_config = config.metrics_config.clone();
         let frontend_api_config = config.frontend_api_config.clone();
         let anthropic_endpoints_enabled = frontend_api_config.anthropic().enabled();
-        let engine_apis_enabled = config.enable_engine_apis || env_is_truthy(ENABLE_ENGINE_API_ENV);
+        let generate_endpoint_enabled =
+            config.enable_engine_apis || env_is_truthy(VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV);
 
         let model_manager = Arc::new(ModelManager::new());
         let cancel_token = config.cancel_token.unwrap_or_default();
@@ -935,7 +937,7 @@ impl HttpServiceConfigBuilder {
         );
         state
             .flags
-            .set(&EndpointType::Generate, engine_apis_enabled);
+            .set(&EndpointType::Generate, generate_endpoint_enabled);
 
         // enable prometheus metrics
         let registry = metrics::Registry::new();
@@ -1034,7 +1036,7 @@ impl HttpServiceConfigBuilder {
             state.clone(),
             &config.request_template,
             anthropic_endpoints_enabled,
-            engine_apis_enabled,
+            generate_endpoint_enabled,
         );
         let mut inference_router = axum::Router::new();
         for (route_docs, route) in endpoint_routes {
@@ -1152,7 +1154,7 @@ impl HttpServiceConfigBuilder {
         state: Arc<State>,
         request_template: &Option<RequestTemplate>,
         enable_anthropic_endpoints: bool,
-        enable_engine_apis: bool,
+        enable_generate_endpoint: bool,
     ) -> Vec<(Vec<RouteDoc>, axum::Router)> {
         let mut routes = Vec::new();
         // Add chat completions route with conditional middleware
@@ -1197,10 +1199,8 @@ impl HttpServiceConfigBuilder {
             );
         }
 
-        if enable_engine_apis {
-            tracing::warn!(
-                "Engine-native APIs (/inference/v1/generate) are experimental and opt-in."
-            );
+        if enable_generate_endpoint {
+            tracing::warn!("The vLLM-compatible /inference/v1/generate API is experimental.");
             let (generate_docs, generate_route) =
                 super::generate::generate_router(state.clone(), None);
             endpoint_routes.insert(EndpointType::Generate, (generate_docs, generate_route));

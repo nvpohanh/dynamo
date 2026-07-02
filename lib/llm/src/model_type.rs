@@ -184,6 +184,11 @@ impl ModelType {
         if self.contains(Self::Completions) {
             endpoint_types.push(crate::endpoint_type::EndpointType::Completion);
         }
+        // Any token-generating model can serve the opt-in, frontend-native
+        // `/inference/v1/generate` surface.
+        if self.supports_chat() || self.supports_completions() {
+            endpoint_types.push(crate::endpoint_type::EndpointType::Generate);
+        }
         if self.contains(Self::Embedding) {
             endpoint_types.push(crate::endpoint_type::EndpointType::Embedding);
         }
@@ -319,5 +324,24 @@ mod tests {
         let endpoints = (ModelType::Chat | ModelType::Realtime).as_endpoint_types();
         assert!(endpoints.contains(&EndpointType::Chat));
         assert!(endpoints.contains(&EndpointType::Realtime));
+    }
+
+    #[test]
+    fn token_generating_models_support_generate_endpoint() {
+        assert!(
+            ModelType::Chat
+                .as_endpoint_types()
+                .contains(&EndpointType::Generate)
+        );
+        assert!(
+            ModelType::Completions
+                .as_endpoint_types()
+                .contains(&EndpointType::Generate)
+        );
+        assert!(
+            !(ModelType::Embedding)
+                .as_endpoint_types()
+                .contains(&EndpointType::Generate)
+        );
     }
 }

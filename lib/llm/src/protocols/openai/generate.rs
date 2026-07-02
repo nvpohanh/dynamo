@@ -13,7 +13,14 @@
 //! contract is forward-compatible: a new vLLM request field flows through with
 //! no change here.
 
+use std::collections::HashMap;
+
+use anyhow::Result;
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+
+use crate::protocols::Annotated;
+use crate::protocols::common::llm_backend::LLMEngineOutput;
 
 /// Token-in/token-out generation request.
 ///
@@ -77,6 +84,111 @@ pub struct GenerateResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_params: Option<serde_json::Value>,
+}
+
+/// Per-index accumulation state while folding a stream of
+/// [`LLMEngineOutput`] deltas into a single [`GenerateResponse`].
+struct GenerateChoiceAcc {
+    index: u32,
+    token_ids: Vec<crate::protocols::TokenIdType>,
+    finish_reason: Option<String>,
+}
+
+/// Folds a stream of [`Annotated<LLMEngineOutput>`] deltas into a single
+/// [`GenerateResponse`]. Each chunk carries a delta of newly generated
+/// `token_ids` keyed by `index` (default 0).
+struct GenerateAggregator {
+    request_id: String,
+    choices: HashMap<u32, GenerateChoiceAcc>,
+    error: Option<String>,
+}
+
+impl GenerateAggregator {
+    fn new(request_id: String) -> Self {
+        Self {
+            request_id,
+            choices: HashMap::new(),
+            error: None,
+        }
+    }
+
+    async fn apply(
+        stream: impl Stream<Item = Annotated<LLMEngineOutput>>,
+        request_id: String,
+    ) -> Result<GenerateResponse> {
+        let aggregator = stream
+            .fold(
+                GenerateAggregator::new(request_id),
+                |mut agg, delta| async move {
+                    let delta = match delta.ok() {
+                        Ok(delta) => delta,
+                        Err(error) => {
+                            agg.error = Some(error);
+                            return agg;
+                        }
+                    };
+
+                    if agg.error.is_none()
+                        && let Some(output) = delta.data
+                    {
+                        let index = output.index.unwrap_or(0);
+                        let choice = agg.choices.entry(index).or_insert(GenerateChoiceAcc {
+                            index,
+                            token_ids: Vec::new(),
+                            finish_reason: None,
+                        });
+                        choice.token_ids.extend(output.token_ids);
+                        if let Some(finish_reason) = output.finish_reason {
+                            choice.finish_reason = Some(finish_reason.to_string());
+                        }
+                    }
+                    agg
+                },
+            )
+            .await;
+
+        if let Some(error) = aggregator.error {
+            return Err(anyhow::anyhow!(error));
+        }
+
+        let mut choices: Vec<GenerateResponseChoice> = aggregator
+            .choices
+            .into_values()
+            .map(|acc| GenerateResponseChoice {
+                index: acc.index,
+                token_ids: Some(acc.token_ids),
+                logprobs: None,
+                finish_reason: acc.finish_reason,
+            })
+            .collect();
+        choices.sort_by_key(|choice| choice.index);
+
+        Ok(GenerateResponse {
+            request_id: aggregator.request_id,
+            choices,
+            prompt_logprobs: None,
+            kv_transfer_params: None,
+        })
+    }
+}
+
+impl GenerateResponse {
+    /// Aggregate a raw engine stream for the non-streaming endpoint.
+    pub async fn from_annotated_stream(
+        stream: impl Stream<Item = Annotated<LLMEngineOutput>>,
+        request_id: String,
+    ) -> Result<GenerateResponse> {
+        GenerateAggregator::apply(stream, request_id).await
+    }
+
+    /// A complete unary response has at least one terminal choice.
+    pub fn is_complete_unary(&self) -> bool {
+        !self.choices.is_empty()
+            && self
+                .choices
+                .iter()
+                .all(|choice| choice.finish_reason.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -157,5 +269,53 @@ mod tests {
         assert_eq!(round.choices.len(), 1);
         assert_eq!(round.choices[0].token_ids, Some(vec![10, 11, 12]));
         assert_eq!(round.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn generate_response_accumulates_engine_deltas() {
+        let chunks = vec![
+            LLMEngineOutput {
+                token_ids: vec![100],
+                index: Some(0),
+                ..Default::default()
+            },
+            LLMEngineOutput {
+                token_ids: vec![101],
+                index: Some(0),
+                finish_reason: Some(crate::protocols::common::FinishReason::Length),
+                ..Default::default()
+            },
+        ];
+        let stream = futures::stream::iter(chunks.into_iter().map(Annotated::from_data));
+
+        let response = GenerateResponse::from_annotated_stream(stream, "req-agg".to_string())
+            .await
+            .expect("aggregate engine deltas");
+
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].token_ids, Some(vec![100, 101]));
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("length"));
+        assert!(response.is_complete_unary());
+    }
+
+    #[tokio::test]
+    async fn incomplete_engine_streams_are_not_complete_unary_responses() {
+        let empty = futures::stream::iter(Vec::<Annotated<LLMEngineOutput>>::new());
+        let empty_response =
+            GenerateResponse::from_annotated_stream(empty, "req-empty".to_string())
+                .await
+                .expect("aggregate empty stream");
+        assert!(!empty_response.is_complete_unary());
+
+        let partial = futures::stream::iter([Annotated::from_data(LLMEngineOutput {
+            token_ids: vec![100],
+            index: Some(0),
+            ..Default::default()
+        })]);
+        let partial_response =
+            GenerateResponse::from_annotated_stream(partial, "req-partial".to_string())
+                .await
+                .expect("aggregate partial stream");
+        assert!(!partial_response.is_complete_unary());
     }
 }

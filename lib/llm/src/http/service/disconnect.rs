@@ -393,6 +393,92 @@ mod tests {
         (metrics, guard, context, handle)
     }
 
+    #[derive(Debug, Default)]
+    struct KillTrackingContext {
+        killed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl dynamo_runtime::engine::AsyncEngineContext for KillTrackingContext {
+        fn id(&self) -> &str {
+            "kill-tracking"
+        }
+
+        fn stop(&self) {}
+
+        fn stop_generating(&self) {}
+
+        fn kill(&self) {
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn is_stopped(&self) -> bool {
+            false
+        }
+
+        fn is_killed(&self) -> bool {
+            self.killed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn stopped(&self) {
+            std::future::pending::<()>().await;
+        }
+
+        async fn killed(&self) {
+            std::future::pending::<()>().await;
+        }
+
+        fn link_child(&self, _: Arc<dyn dynamo_runtime::engine::AsyncEngineContext>) {}
+    }
+
+    fn generate_cancellation_labels() -> CancellationLabels {
+        CancellationLabels {
+            model: "test-model".to_string(),
+            endpoint: Endpoint::Generate.to_string(),
+            request_type: "unary".to_string(),
+        }
+    }
+
+    async fn wait_for_kill(context: &Arc<KillTrackingContext>) {
+        for _ in 0..100 {
+            if context.is_killed() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn armed_handle_drop_kills_generate_context() {
+        let context = Arc::new(KillTrackingContext::default());
+        let engine_context: Arc<dyn AsyncEngineContext> = context.clone();
+        let (connection_handle, stream_handle) =
+            create_connection_monitor(engine_context, None, generate_cancellation_labels()).await;
+
+        drop(connection_handle);
+        drop(stream_handle);
+
+        wait_for_kill(&context).await;
+        assert!(context.is_killed());
+    }
+
+    #[tokio::test]
+    async fn disarmed_handle_does_not_kill_generate_context() {
+        let context = Arc::new(KillTrackingContext::default());
+        let engine_context: Arc<dyn AsyncEngineContext> = context.clone();
+        let (mut connection_handle, stream_handle) =
+            create_connection_monitor(engine_context, None, generate_cancellation_labels()).await;
+
+        connection_handle.disarm();
+        drop(connection_handle);
+        drop(stream_handle);
+
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!context.is_killed());
+    }
+
     /// Zombie backend with hanging stream is terminated by inactivity timeout.
     #[tokio::test(start_paused = true)]
     async fn test_backend_inactivity_timeout_releases_inflight_gauge() {
