@@ -524,7 +524,57 @@ class TestRoutedEnginePath:
             "input_tokens": 3,
             "output_tokens": 1,
             "chunk_tokens": 1,
+            "image_count": 0,
+            "video_count": 0,
+            "audio_count": 0,
         }
+
+    @pytest.mark.asyncio
+    async def test_routed_stream_emits_multimodal_counts(self, vllm_processor_module):
+        # The Rust postprocessor is bypassed on this path, so the processor must
+        # emit per-request multimodal content-part counts itself.
+        routed_engine = _FakeRoutedEngine(
+            [{"token_ids": [101], "index": 0, "finish_reason": None}]
+        )
+        processor = _make_processor(vllm_processor_module, routed_engine)
+
+        request = {
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "compare"},
+                        {"type": "image_url", "image_url": {"url": "http://x/a.png"}},
+                        {"type": "image_url", "image_url": {"url": "http://x/b.png"}},
+                        {"type": "video_url", "video_url": {"url": "http://x/c.mp4"}},
+                    ],
+                }
+            ],
+        }
+        preproc = _base_preproc()
+        chunks = [
+            item
+            async for item in processor._generate_and_stream(
+                "request-id",
+                request,
+                preproc,
+                preproc["token_ids"],
+                SimpleNamespace(
+                    sampling_params=SimpleNamespace(n=1),
+                    request_id="vllm-request",
+                    external_req_id=None,
+                ),
+                {0: _FakePostProcessor()},
+                mm_routing_info=None,
+                context=None,
+            )
+        ]
+
+        metrics = json.loads(chunks[0]["comment"][0])
+        assert metrics["image_count"] == 2
+        assert metrics["video_count"] == 1
+        assert metrics["audio_count"] == 0
 
 
 OBJECT_TYPED_TOOL_REQUEST = {

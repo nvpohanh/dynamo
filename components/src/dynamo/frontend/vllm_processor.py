@@ -667,9 +667,21 @@ class VllmProcessor:
                 output_request_ids[output_idx] = child_request_id
                 registered_request_ids.append(child_request_id)
 
-        # llm_metrics totals; Rust postprocessor is bypassed on this path.
+        # llm_metrics totals; Rust postprocessor is bypassed on this path, so the
+        # multimodal content-part counts must be emitted here too (otherwise the
+        # frontend metrics would report zero media for this processor).
+        #
+        # Counting basis mirrors the Rust preprocessor (multi_modal_data): media
+        # parts in user-role messages. extract_mm_urls counts URL-bearing parts
+        # (including data: URIs, which carry a non-empty url); a degenerate part
+        # with an empty/missing url is skipped, matching neither over- nor
+        # under-counting real requests.
         input_tokens = len(tokens)
         cumulative_output_tokens = 0
+        _mm_counts = extract_mm_urls(request.get("messages") or []) or {}
+        image_count = len(_mm_counts.get("image_url", []))
+        video_count = len(_mm_counts.get("video_url", []))
+        audio_count = len(_mm_counts.get("audio_url", []))
 
         try:
             _inject_routing_metadata(dynamo_preproc, dynamo_preproc, mm_routing_info)
@@ -796,6 +808,9 @@ class VllmProcessor:
                     "input_tokens": input_tokens,
                     "output_tokens": cumulative_output_tokens,
                     "chunk_tokens": chunk_tokens,
+                    "image_count": image_count,
+                    "video_count": video_count,
+                    "audio_count": audio_count,
                 }
                 envelope["event"] = "llm_metrics"
                 envelope["comment"] = [json.dumps(metrics)]

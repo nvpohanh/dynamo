@@ -72,6 +72,53 @@ impl
                     tokenize_latency: None,
                     detokenize_total_latency: None,
                     detokenize_count: None,
+                    ..Default::default()
+                };
+                if let Ok(ann) = metrics.to_annotation::<NvCreateChatCompletionStreamResponse>() {
+                    annotated.event = ann.event;
+                    annotated.comment = ann.comment;
+                }
+                yield annotated;
+            }
+        };
+
+        Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+/// Emits chunks whose `LLMMetricAnnotation` carries fixed multimodal counts
+/// (2 images, 1 video, 0 audio) so the annotation -> observe -> registration ->
+/// `/metrics` exposition path can be verified end to end.
+struct MockMultimodalEngine {}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateChatCompletionRequest>,
+        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+        Error,
+    > for MockMultimodalEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<NvCreateChatCompletionRequest>,
+    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
+        let (request, context) = request.transfer(());
+        let ctx = context.context();
+        let mut generator = request.response_generator(ctx.id().to_string());
+
+        let stream = stream! {
+            for i in 0..3 {
+                let output = generator.create_choice(i, Some(format!("chunk {i}")), None, None);
+                let mut annotated = Annotated::from_data(output);
+                let metrics = LLMMetricAnnotation {
+                    input_tokens: 5,
+                    output_tokens: (i + 1) as usize,
+                    chunk_tokens: 1,
+                    image_count: 2,
+                    video_count: 1,
+                    audio_count: 0,
+                    ..Default::default()
                 };
                 if let Ok(ann) = metrics.to_annotation::<NvCreateChatCompletionStreamResponse>() {
                     annotated.event = ann.event;
@@ -313,6 +360,100 @@ async fn test_metrics_with_mock_model() {
         assert!(metrics_body.contains("status=\"success\""));
 
         // Clean up
+        cancel_token.cancel();
+        task.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_multimodal_count_metrics_exposed() {
+    // End-to-end: POST a request whose engine emits multimodal counts, consume
+    // the stream, then GET /metrics and assert the per-request histograms are
+    // registered and exposed with the right sums/count. Covers annotation
+    // parsing -> observe -> registration -> Prometheus exposition as one path.
+    temp_env::async_with_vars([(METRICS_PREFIX_ENV, None::<&str>)], async {
+        let (listener, port) = bind_random_port().await;
+        let service = HttpService::builder()
+            .port(port)
+            .enable_chat_endpoints(true)
+            .build()
+            .unwrap();
+
+        let state = service.state_clone();
+        let manager = state.manager();
+
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+        let task =
+            tokio::spawn(async move { service.run_with_listener(token.clone(), listener).await });
+
+        let card = ModelDeploymentCard::with_name_only("mmmodel");
+        let mock_engine = Arc::new(MockMultimodalEngine {});
+        manager
+            .add_chat_completions_model("mmmodel", card.mdcsum(), mock_engine)
+            .unwrap();
+
+        wait_for_metrics_ready(port).await;
+
+        let client = reqwest::Client::new();
+        let message = dynamo_protocols::types::ChatCompletionRequestMessage::User(
+            dynamo_protocols::types::ChatCompletionRequestUserMessage {
+                content: dynamo_protocols::types::ChatCompletionRequestUserMessageContent::Text(
+                    "Hello".to_string(),
+                ),
+                name: None,
+            },
+        );
+        let request = dynamo_protocols::types::CreateChatCompletionRequestArgs::default()
+            .model("mmmodel")
+            .messages(vec![message])
+            .max_tokens(50u32)
+            .stream(true)
+            .build()
+            .expect("Failed to build request");
+
+        let response = client
+            .post(format!("http://localhost:{}/v1/chat/completions", port))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let _ = response.bytes().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let metrics_body = client
+            .get(format!("http://localhost:{}/metrics", port))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        // Latched once per request across the streamed chunks: count == 1,
+        // sums == the per-request counts (2 images, 1 video, 0 audio). Assertions
+        // include the trailing newline so a value like `1` can't prefix-match `10`.
+        assert!(
+            metrics_body
+                .contains("dynamo_frontend_images_per_request_count{model=\"mmmodel\"} 1\n"),
+            "images_per_request_count should be 1; got:\n{metrics_body}"
+        );
+        assert!(
+            metrics_body.contains("dynamo_frontend_images_per_request_sum{model=\"mmmodel\"} 2\n"),
+            "images_per_request_sum should be 2; got:\n{metrics_body}"
+        );
+        assert!(
+            metrics_body.contains("dynamo_frontend_videos_per_request_sum{model=\"mmmodel\"} 1\n"),
+            "videos_per_request_sum should be 1; got:\n{metrics_body}"
+        );
+        assert!(
+            metrics_body.contains("dynamo_frontend_audio_per_request_sum{model=\"mmmodel\"} 0\n"),
+            "audio_per_request_sum should be 0; got:\n{metrics_body}"
+        );
+
         cancel_token.cancel();
         task.await.unwrap().unwrap();
     })

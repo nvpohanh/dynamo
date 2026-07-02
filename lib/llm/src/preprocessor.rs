@@ -187,6 +187,38 @@ pub struct MmImageEntry {
     pub height: u32,
 }
 
+/// Per-request multimodal content-part counts, carried from preprocessing to the
+/// metrics annotation. Modality-agnostic and independent of the `mm-routing`
+/// feature: derived from the parsed `multi_modal_data` map, which is populated on
+/// both the frontend-decode and URL-passthrough paths.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MultimodalCounts {
+    pub image: usize,
+    pub video: usize,
+    pub audio: usize,
+}
+
+impl MultimodalCounts {
+    /// Count `image_url` / `video_url` / `audio_url` content parts from the
+    /// preprocessed request. Each content part contributes exactly one entry to
+    /// its modality's vec, so the vec length is the part count. Zero for
+    /// text-only requests.
+    fn from_preprocessed(request: &PreprocessedRequest) -> Self {
+        let count = |key: &str| {
+            request
+                .multi_modal_data
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .map_or(0, |v| v.len())
+        };
+        Self {
+            image: count("image_url"),
+            video: count("video_url"),
+            audio: count("audio_url"),
+        }
+    }
+}
+
 /// Derive the model's local directory from the MDC. The directory is the
 /// parent of `config.json` (which lives in `mdc.model_info` as `HfConfigJson`)
 /// and contains the other artifacts MM-aware routing reads at startup
@@ -2015,6 +2047,7 @@ impl OpenAIPreprocessor {
         emit_audit_usage_chunk: bool,
         trace_tokens_enabled: bool,
         trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
+        mm_counts: MultimodalCounts,
     ) -> impl Stream<Item = Annotated<Resp>> + Send
     where
         S: Stream<Item = Annotated<BackendOutput>> + Send + 'static,
@@ -2038,6 +2071,7 @@ impl OpenAIPreprocessor {
             emit_audit_usage_chunk: bool,
             trace_tokens_enabled: bool,
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
+            mm_counts: MultimodalCounts,
         }
 
         let state = State {
@@ -2053,6 +2087,7 @@ impl OpenAIPreprocessor {
             emit_audit_usage_chunk,
             trace_tokens_enabled,
             trace_finish_reason_metadata,
+            mm_counts,
         };
 
         // transform the common response stream into a chat response stream
@@ -2164,6 +2199,9 @@ impl OpenAIPreprocessor {
                         output_tokens: current_osl,
                         chunk_tokens,
                         cached_tokens: None,
+                        image_count: inner.mm_counts.image,
+                        video_count: inner.mm_counts.video,
+                        audio_count: inner.mm_counts.audio,
                         prefill_worker_id,
                         prefill_dp_rank,
                         prefill_worker_type,
@@ -2241,6 +2279,9 @@ impl OpenAIPreprocessor {
                             output_tokens: usage.completion_tokens as usize,
                             chunk_tokens: 0,
                             cached_tokens,
+                            image_count: inner.mm_counts.image,
+                            video_count: inner.mm_counts.video,
+                            audio_count: inner.mm_counts.audio,
                             prefill_worker_id,
                             prefill_dp_rank,
                             prefill_worker_type,
@@ -3021,6 +3062,10 @@ impl
         // Attach the timing tracker to the request so downstream components can record metrics
         common_request.tracker = tracker;
 
+        // Multimodal content-part counts for per-request usage metrics. Captured
+        // before `common_request` is moved into the context below.
+        let mm_counts = MultimodalCounts::from_preprocessed(&common_request);
+
         let mut response_generator = Box::new(response_generator);
 
         // Update ISL only for text prompts (embeddings get sequence length from tensor shape)
@@ -3052,6 +3097,7 @@ impl
             audit_handle.is_some(),
             trace_tokens_enabled,
             trace_finish_reason_metadata,
+            mm_counts,
         );
 
         let transformed_stream = self.postprocessor_parsing_stream(
@@ -3221,7 +3267,8 @@ impl
         // Extract context once
         let context = response_stream.context();
 
-        // transform the postprocessor stream
+        // transform the postprocessor stream. Legacy `/v1/completions` is
+        // text-only, so multimodal counts are always zero here.
         let stream = Self::transform_postprocessor_stream(
             response_stream,
             response_generator,
@@ -3229,6 +3276,7 @@ impl
             false,
             trace_tokens_enabled,
             trace_finish_reason_metadata,
+            MultimodalCounts::default(),
         );
 
         let stream = crate::request_trace::wrap_completion_request_end_stream(
@@ -3358,6 +3406,52 @@ mod strip_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::common::preprocessor::MultimodalData;
+    use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+
+    fn url_entry(u: &str) -> MultimodalData {
+        MultimodalData::Url(url::Url::parse(u).unwrap())
+    }
+
+    fn preprocessed_with_media(media: Option<MultimodalDataMap>) -> PreprocessedRequest {
+        let mut b = PreprocessedRequest::builder();
+        b.model("m".to_string())
+            .token_ids(vec![1, 2, 3])
+            .stop_conditions(StopConditions::default())
+            .sampling_options(SamplingOptions::default())
+            .output_options(OutputOptions::default());
+        if let Some(m) = media {
+            b.multi_modal_data(Some(m));
+        }
+        b.build().unwrap()
+    }
+
+    #[test]
+    fn test_multimodal_counts_from_preprocessed_mixed() {
+        // 2 images, 1 video, 0 audio -> counts reflect vec lengths per modality.
+        let mut map: MultimodalDataMap = HashMap::new();
+        map.insert(
+            "image_url".to_string(),
+            vec![url_entry("http://x/a.png"), url_entry("http://x/b.png")],
+        );
+        map.insert("video_url".to_string(), vec![url_entry("http://x/c.mp4")]);
+
+        let req = preprocessed_with_media(Some(map));
+        let counts = MultimodalCounts::from_preprocessed(&req);
+        assert_eq!(counts.image, 2);
+        assert_eq!(counts.video, 1);
+        assert_eq!(counts.audio, 0);
+    }
+
+    #[test]
+    fn test_multimodal_counts_from_preprocessed_text_only() {
+        // No multi_modal_data -> all zero.
+        let req = preprocessed_with_media(None);
+        let counts = MultimodalCounts::from_preprocessed(&req);
+        assert_eq!(counts.image, 0);
+        assert_eq!(counts.video, 0);
+        assert_eq!(counts.audio, 0);
+    }
 
     #[test]
     fn routing_priorities_keep_strict_tier_independent() {
@@ -3389,6 +3483,7 @@ mod tests {
             tokenize_latency: Some(std::time::Duration::from_millis(5)),
             detokenize_total_latency: Some(std::time::Duration::from_micros(50)),
             detokenize_count: Some(6),
+            ..Default::default()
         }
     }
 

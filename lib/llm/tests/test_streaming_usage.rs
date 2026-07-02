@@ -228,6 +228,7 @@ async fn test_streaming_without_usage() {
         false,
         false,
         None,
+        Default::default(),
     );
 
     // Collect all chunks
@@ -290,6 +291,7 @@ async fn test_streaming_with_usage_compliance() {
         false,
         false,
         None,
+        Default::default(),
     );
 
     // Collect all chunks
@@ -366,6 +368,7 @@ async fn test_streaming_with_continuous_usage() {
         false,
         false,
         None,
+        Default::default(),
     );
 
     // Collect all chunks
@@ -460,6 +463,7 @@ async fn test_streaming_with_usage_false() {
         false,
         false,
         None,
+        Default::default(),
     );
 
     // Collect all chunks
@@ -588,6 +592,7 @@ async fn test_nonstreaming_has_usage_field() {
         false,
         false,
         None,
+        Default::default(),
     );
 
     // Aggregate the streaming chunks into a single non-streaming response
@@ -647,6 +652,7 @@ async fn test_cmpl_streaming_with_usage_true_no_backend_usage() {
         false,
         false,
         None,
+        Default::default(),
     );
 
     let chunks: Vec<_> = transformed_stream.collect().await;
@@ -714,6 +720,7 @@ async fn test_cmpl_streaming_with_cached_tokens_propagation() {
         false,
         false,
         None,
+        Default::default(),
     );
     let chunks: Vec<_> = transformed_stream.collect().await;
 
@@ -761,6 +768,7 @@ async fn test_chat_streaming_with_cached_tokens_propagation() {
         false,
         false,
         None,
+        Default::default(),
     );
     let chunks: Vec<_> = transformed_stream.collect().await;
 
@@ -808,6 +816,7 @@ async fn test_cmpl_nonstreaming_has_usage_and_cached_tokens() {
         false,
         false,
         None,
+        Default::default(),
     );
 
     // Aggregate into a single non-streaming response
